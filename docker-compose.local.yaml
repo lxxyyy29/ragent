@@ -1,0 +1,139 @@
+# Ragent AI 本地开发环境一键启动
+# 包含: PostgreSQL+pgvector, Redis, RocketMQ, RustFS(S3)
+#
+# 启动: docker compose -f docker-compose.local.yaml up -d
+# 停止: docker compose -f docker-compose.local.yaml down
+
+name: ragent-local
+
+services:
+  # ============================================
+  # PostgreSQL + pgvector (数据库 + 向量存储)
+  # ============================================
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ragent-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ragent
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./resources/database/schema_pg.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./resources/database/init_data_pg.sql:/docker-entrypoint-initdb.d/02-init_data.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ragent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # Redis (缓存 / 限流 / 排队)
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: ragent-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass 123456
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "123456", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # RustFS (S3 兼容对象存储)
+  # ============================================
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.72
+    container_name: ragent-rustfs
+    command:
+      - "--address"
+      - ":9000"
+      - "--console-enable"
+      - "--access-key"
+      - "rustfsadmin"
+      - "--secret-key"
+      - "rustfsadmin"
+      - "/data"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - rustfs-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/rustfs/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # RocketMQ Name Server
+  # ============================================
+  rmqnamesrv:
+    image: apache/rocketmq:5.2.0
+    container_name: ragent-rmqnamesrv
+    ports:
+      - "9876:9876"
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx400m"
+    command: sh mqnamesrv
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q 'The Name Server boot success' /home/rocketmq/logs/rocketmqlogs/namesrv.log || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ============================================
+  # RocketMQ Broker
+  # ============================================
+  rmqbroker:
+    image: apache/rocketmq:5.2.0
+    container_name: ragent-rmqbroker
+    ports:
+      - "10912:10912"
+      - "10911:10911"
+      - "10909:10909"
+      - "18080:8080"
+      - "18081:8081"
+      - "18082:8082"
+    environment:
+      NAMESRV_ADDR: "rmqnamesrv:9876"
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m"
+    depends_on:
+      rmqnamesrv:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        cat > /home/rocketmq/rocketmq-5.2.0/conf/broker.conf << EOF
+        brokerClusterName = DefaultCluster
+        brokerName = broker-a
+        brokerId = 0
+        deleteWhen = 04
+        fileReservedTime = 48
+        brokerRole = ASYNC_MASTER
+        flushDiskType = ASYNC_FLUSH
+        brokerIP1 = 192.168.1.6
+        listenPort = 10911
+        timerMaxDelaySec = 31622400
+        EOF
+        sh mqbroker --enable-proxy \
+          -c /home/rocketmq/rocketmq-5.2.0/conf/broker.conf
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  rustfs-data:

@@ -37,6 +37,9 @@ services:
       retries: 10
       start_period: 40s
     restart: unless-stopped
+    networks:
+      - default
+      - ragent-local
 
   lightrag:
     container_name: lightrag
@@ -64,6 +67,8 @@ services:
       LLM_BINDING_HOST: "${LLM_BINDING_HOST:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
       LLM_BINDING_API_KEY: "${BAILIAN_API_KEY:?BAILIAN_API_KEY is required}"
       LLM_MODEL: "${LLM_MODEL:-qwen-plus-latest}"
+      # 单次 LLM 调用超时（秒），默认 240；CPU 本地模型需加大，否则抽取会被 Worker 超时杀掉
+      LLM_TIMEOUT: "${LLM_TIMEOUT:-240}"
       # 实体 / 关系的描述与摘要输出语言，LightRAG 默认 English；本项目为中文库故置中文
       # 仅对改后新建 / 重建的索引生效，已抽取出的英文描述需重建索引才会转为中文
       SUMMARY_LANGUAGE: "${SUMMARY_LANGUAGE:-简体中文}"
@@ -94,6 +99,9 @@ services:
     depends_on:
       neo4j:
         condition: service_healthy
+    networks:
+      - default
+      - ragent-local
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9621/health')\" >/dev/null 2>&1 || exit 1"]
       interval: 20s
@@ -110,3 +118,6 @@ volumes:
 networks:
   default:
     name: lightrag-net
+  ragent-local:
+    external: true
+    name: ragent-local_default
