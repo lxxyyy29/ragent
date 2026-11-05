@@ -1,4 +1,6 @@
-import { Navigate, createBrowserRouter } from "react-router-dom";
+import { Navigate, createBrowserRouter, type RouteObject } from "react-router-dom";
+
+import { RouterErrorPage } from "@/components/common/RouterErrorPage";
 
 import { LoginPage } from "@/pages/LoginPage";
 import { EngineGate } from "@/components/common/EngineGate";
@@ -64,7 +66,7 @@ function HomeRedirect() {
   return <Navigate to={isAuthenticated ? "/chat" : "/login"} replace />;
 }
 
-export const router = createBrowserRouter([
+const routes: RouteObject[] = [
   {
     path: "/",
     element: <HomeRedirect />
@@ -207,4 +209,9 @@ export const router = createBrowserRouter([
     path: "*",
     element: <NotFoundPage />
   }
-]);
+];
+
+// 统一挂错误兜底页：渲染期异常不再把堆栈直接甩给用户
+export const router = createBrowserRouter(
+  routes.map((route) => ({ ...route, errorElement: <RouterErrorPage /> }))
+);

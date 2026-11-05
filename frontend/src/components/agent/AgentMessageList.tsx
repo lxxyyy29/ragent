@@ -240,6 +240,9 @@ export function AgentMessageList({
       ref={virtuosoRef}
       data={turns}
       initialTopMostItemIndex={initialTopMostItemIndex}
+      // 稳定 key：默认按 index 生成，流式追加/删除条目时会导致 DOM 复用错乱，
+      // 进而触发 React 的 removeChild NotFoundError，这里按业务 id 固定
+      computeItemKey={(_index, turn) => turn.id}
       // 贴底逻辑与工作流版一致：不启用 followOutput 由 streaming effect 与高度变化回调接管
       followOutput={false}
       scrollerRef={(node) => {

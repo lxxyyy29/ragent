@@ -280,6 +280,8 @@ export function MessageList({ messages, isLoading, isStreaming, sessionKey }: Me
         ref={virtuosoRef}
         data={messages}
         initialTopMostItemIndex={initialTopMostItemIndex}
+        // 稳定 key：避免默认按 index 复用 DOM 导致 React removeChild 报错
+        computeItemKey={(_index, message) => message.id}
         // 不启用 followOutput 自动贴底：发送/流式贴底由 streaming effect 与 totalListHeightChanged 负责，
         // 会话加载贴底由布局 effect 负责。若开启，展开推荐/来源等“已到底后条目变高”会被当作新内容触发贴底，
         // 把变高的最后一条（回答+面板）顶得超出视口、回答被推到可视区上方
