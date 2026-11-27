@@ -22,8 +22,10 @@ import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.nageoffer.ai.ragent.mcp.dao.entity.OrderDO;
 import com.nageoffer.ai.ragent.mcp.dao.entity.OrderItemDO;
+import com.nageoffer.ai.ragent.mcp.dao.mapper.AfterSaleMapper;
 import com.nageoffer.ai.ragent.mcp.dao.mapper.OrderItemMapper;
 import com.nageoffer.ai.ragent.mcp.dao.mapper.OrderMapper;
+import com.nageoffer.ai.ragent.mcp.dao.result.AfterSaleDetailResult;
 import com.nageoffer.ai.ragent.mcp.config.McpToolAnnotations;
 import com.nageoffer.ai.ragent.mcp.executor.McpToolResults;
 import com.nageoffer.ai.ragent.mcp.executor.McpToolSchema;
@@ -38,8 +40,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.stereotype.Component;
 
 import java.sql.Timestamp;
-import java.time.Duration;
-import java.time.Instant;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -51,7 +52,7 @@ import static com.nageoffer.ai.ragent.mcp.executor.McpToolSchema.integer;
 /**
  * 订单查询，比特严选订单相关那几条路的入口
  * <p>
- * 不传单号返回最近几笔，是「我的快递到哪了」唯一开得了头的地方——用户手里通常没有订单号
+ * 不传单号返回近几个月的订单列表，是「我的快递到哪了」唯一开得了头的地方——用户手里通常没有订单号
  */
 @Slf4j
 @Component
@@ -60,18 +61,22 @@ public class BitOrderQueryMcpExecutor {
 
     private static final String TOOL_ID = "query_order";
 
-    private static final int DEFAULT_LIMIT = 5;
-    private static final int MAX_LIMIT = 20;
+    private static final int DEFAULT_MONTHS = 3;
+    private static final int MAX_MONTHS = 24;
 
     /**
-     * 七天无理由的窗口长度，按签收时间现算，不采信模型算出来的天数
+     * 列表固定列这么多笔，不让模型挑：挑小了会把多单汇总答成部分订单
      */
-    private static final int RETURN_WINDOW_DAYS = 7;
+    private static final int LIST_SIZE = 20;
 
-    private static final int QUALITY_WINDOW_DAYS = 15;
+    /**
+     * 一单的售后单数量有限，取够判断换货即可
+     */
+    private static final int AFTER_SALE_LIMIT = 20;
 
     private final OrderMapper orderMapper;
     private final OrderItemMapper orderItemMapper;
+    private final AfterSaleMapper afterSaleMapper;
 
     @Bean
     public McpServerFeatures.SyncToolSpecification queryOrderToolSpecification() {
@@ -83,17 +88,18 @@ public class BitOrderQueryMcpExecutor {
 
     private Tool buildTool() {
         JsonSchema inputSchema = McpToolSchema.object()
-                .optional(string("orderNo", "订单号，如 88231；不填则返回最近若干笔订单摘要"))
-                .optional(integer("limit", "不填订单号时返回几笔，默认 5，最多 20")
-                        .defaultTo(DEFAULT_LIMIT))
+                .optional(string("orderNo", "订单号，取自订单列表；不填则返回订单列表"))
+                .optional(integer("months", "不填订单号时查近几个月的订单，默认 3，最多 24")
+                        .defaultTo(DEFAULT_MONTHS))
                 .build();
 
         return Tool.builder()
                 .name(TOOL_ID)
-                .description("查询当前登录用户的订单。传订单号返回单笔详情，含状态、下单支付发货签收四个时间、"
-                        + "商品明细、金额与优惠、运单号、收货信息，已签收的还会给出七天无理由窗口的剩余天数；"
-                        + "不传订单号返回最近几笔订单摘要。用户说不出订单号时先不传参数拿最近订单，"
-                        + "再按用户确认的那一单继续。运单号只能从这里取，不要自行构造")
+                .description("查询当前登录用户的订单，只能查本账号名下的，不能按手机号、姓名或其他账号查。"
+                        + "传订单号返回单笔详情，含状态、下单支付发货签收四个时间、"
+                        + "商品明细、金额与是否用券、运单号、收货信息，已签收的还会给出原订单售后窗口的截止日期与剩余天数，同一商品行换过货的会注明换回新品的期限需人工核实；"
+                        + "不传订单号返回近几个月的订单列表，按下单时间倒序最多列 20 笔，并给出这段时间的订单总数。"
+                        + "运单号只能从这里取得")
                 .inputSchema(inputSchema)
                 .annotations(McpToolAnnotations.READ_ONLY)
                 .build();
@@ -108,14 +114,14 @@ public class BitOrderQueryMcpExecutor {
         try {
             Map<String, Object> args = McpToolResults.args(request);
             String orderNo = StrUtil.trimToNull(MapUtil.getStr(args, "orderNo"));
-            int limit = BitToolSupport.limit(MapUtil.getInt(args, "limit"), DEFAULT_LIMIT, MAX_LIMIT);
+            int months = BitToolSupport.limit(MapUtil.getInt(args, "months"), DEFAULT_MONTHS, MAX_MONTHS);
 
             String result = orderNo != null
                     ? queryDetail(userId, orderNo)
-                    : queryRecent(userId, limit);
+                    : queryRecent(userId, months);
 
-            log.info("MCP 工具调用完成, toolId={}, orderNo={}, limit={}, elapsed={}ms",
-                    TOOL_ID, orderNo, limit, System.currentTimeMillis() - startMs);
+            log.info("MCP 工具调用完成, toolId={}, orderNo={}, months={}, elapsed={}ms",
+                    TOOL_ID, orderNo, months, System.currentTimeMillis() - startMs);
             return result == null ? BitToolSupport.notFound("订单 " + orderNo) : McpToolResults.success(result);
         } catch (Exception e) {
             log.error("MCP 工具调用失败, toolId={}, elapsed={}ms",
@@ -156,38 +162,62 @@ public class BitOrderQueryMcpExecutor {
             sb.append(String.format("优惠: -%s%s%n", BitToolSupport.money(head.getDiscountAmount()),
                     head.getCouponCode() == null ? "" : "（券 " + head.getCouponCode() + "）"));
         }
-        sb.append(String.format("实付: %s%n", BitToolSupport.money(head.getPayAmount())));
+        // 没用券也要明说：这一行不出现，模型会照手册的通用话术告诉用户「券会退回」
+        if (StrUtil.isBlank(head.getCouponCode())) {
+            sb.append("优惠券: 本单未使用\n");
+        }
+        sb.append(String.format("%s: %s%n", amountLabel(head), BitToolSupport.money(head.getPayAmount())));
 
         sb.append(String.format("%n收货信息: %s | %s | %s%n", head.getReceiverName(),
                 BitToolSupport.maskPhone(head.getReceiverPhone()), BitToolSupport.maskAddress(head.getReceiverAddress())));
         sb.append(String.format("运单号: %s%n", head.getTrackingNo() == null ? "尚未发货" : head.getTrackingNo()));
 
-        String window = returnWindow(head);
-        if (window != null) {
-            sb.append("\n").append(window).append("\n");
+        if (head.getReceiveTime() != null) {
+            sb.append("\n").append(BitToolSupport.returnWindow(head.getReceiveTime(), BitToolSupport.today())).append("\n");
+            String notice = exchangeNotice(afterSaleMapper.selectDetails(userId, null, head.getOrderNo(), AFTER_SALE_LIMIT));
+            if (notice != null) {
+                sb.append(notice).append("\n");
+            }
         }
         return sb.toString().trim();
     }
 
-    private String queryRecent(String userId, int limit) {
-        List<OrderDO> heads = orderMapper.selectRecent(userId, limit);
-        if (heads.isEmpty()) {
-            return "当前账号名下还没有订单";
+    /**
+     * 换过货的商品行，原订单窗口不适用于换回来的新品；没有已完成的换货单返回 null
+     */
+    static String exchangeNotice(List<AfterSaleDetailResult> sales) {
+        List<String> exchanged = sales.stream()
+                .filter(row -> "换货".equals(row.getType()) && "已完成".equals(row.getStatus()))
+                .map(row -> row.getAfterSaleNo() + "（" + row.getSkuCode() + "）")
+                .toList();
+        if (exchanged.isEmpty()) {
+            return null;
         }
+        return "该商品行已有已完成的换货单 " + String.join("、", exchanged) + "，上面的窗口按原订单签收时间计算；"
+                + "换回新品的 7 天、15 天退换期限需人工核实，同单其他商品不受影响";
+    }
+
+    private String queryRecent(String userId, int months) {
+        Timestamp since = windowStart(months, BitToolSupport.today());
+        long total = orderMapper.countSince(userId, since);
+        if (total == 0) {
+            return listHeader(months, 0, 0);
+        }
+        List<OrderDO> heads = orderMapper.selectRecent(userId, since, LIST_SIZE);
         Map<String, List<OrderItemDO>> itemsByOrder = new LinkedHashMap<>();
         queryItems(heads.stream().map(OrderDO::getOrderNo).toList())
                 .forEach(item -> itemsByOrder.computeIfAbsent(item.getOrderNo(), key -> new ArrayList<>()).add(item));
 
         StringBuilder sb = new StringBuilder();
-        sb.append(String.format("【最近 %d 笔订单】%n%n", heads.size()));
+        sb.append(listHeader(months, total, heads.size())).append("\n\n");
         for (int i = 0; i < heads.size(); i++) {
             OrderDO head = heads.get(i);
             String goods = itemsByOrder.getOrDefault(head.getOrderNo(), List.of()).stream()
                     .map(item -> item.getSkuName() + " ×" + item.getQuantity())
                     .reduce((left, right) -> left + "、" + right)
                     .orElse(BitToolSupport.EMPTY_FIELD);
-            sb.append(String.format("%d. 订单 %s | %s | 实付 %s | 下单 %s%n",
-                    i + 1, head.getOrderNo(), head.getStatus(), BitToolSupport.money(head.getPayAmount()),
+            sb.append(String.format("%d. 订单 %s | %s | %s %s | 下单 %s%n",
+                    i + 1, head.getOrderNo(), head.getStatus(), amountLabel(head), BitToolSupport.money(head.getPayAmount()),
                     BitToolSupport.dateTime(head.getCreateTime())));
             sb.append(String.format("   商品: %s%n", goods));
             if (head.getTrackingNo() != null) {
@@ -195,6 +225,33 @@ public class BitOrderQueryMcpExecutor {
             }
         }
         return sb.toString().trim();
+    }
+
+    /**
+     * 下单时就写入了金额，没有支付时间的单子不能说成已付款
+     */
+    private static String amountLabel(OrderDO head) {
+        return head.getPayTime() == null ? "应付" : "实付";
+    }
+
+    static Timestamp windowStart(int months, LocalDate today) {
+        return Timestamp.from(today.minusMonths(months).atStartOfDay(BitToolSupport.ZONE).toInstant());
+    }
+
+    /**
+     * 总数和列出的笔数一起报：只给列表，模型分不出这是全部订单还是其中一部分
+     */
+    static String listHeader(int months, long total, int listed) {
+        if (total == 0) {
+            return months < MAX_MONTHS
+                    ? String.format("近 %d 个月没有订单；更早的购买可把 months 调大（最多 %d）再查", months, MAX_MONTHS)
+                    : String.format("近 %d 个月没有订单", months);
+        }
+        if (listed >= total) {
+            return String.format("【近 %d 个月共 %d 笔订单，已全部列出】", months, total);
+        }
+        return String.format("【近 %d 个月共 %d 笔订单，以下为最近 %d 笔，其余 %d 笔未列出】",
+                months, total, listed, total - listed);
     }
 
     private List<OrderItemDO> queryItems(List<String> orderNos) {
@@ -206,35 +263,9 @@ public class BitOrderQueryMcpExecutor {
                 .orderByAsc(OrderItemDO::getOrderNo, OrderItemDO::getId));
     }
 
-    /**
-     * 窗口按签收时间现算，语料里的时间全是相对 now() 灌的，写死天数过几天就全错
-     */
-    /**
-     * 两个窗口一起报：只说七天无理由过了，模型会以为售后彻底没门，实际第 8 到 15 天还收质量问题
-     */
-    private String returnWindow(OrderDO head) {
-        if (head.getReceiveTime() == null) {
-            return null;
-        }
-        Instant receivedAt = head.getReceiveTime().toInstant();
-        long signedDays = BitToolSupport.daysSince(head.getReceiveTime());
-        long noReasonLeft = Duration.between(Instant.now(),
-                receivedAt.plus(Duration.ofDays(RETURN_WINDOW_DAYS))).toDays();
-        if (noReasonLeft >= 0) {
-            return String.format("售后窗口: 已签收 %d 天，七天无理由剩余 %d 天", signedDays, noReasonLeft);
-        }
-        long qualityLeft = Duration.between(Instant.now(),
-                receivedAt.plus(Duration.ofDays(QUALITY_WINDOW_DAYS))).toDays();
-        return qualityLeft >= 0
-                ? String.format("售后窗口: 已签收 %d 天，七天无理由已过，十五天质量问题窗口剩余 %d 天",
-                signedDays, qualityLeft)
-                : String.format("售后窗口: 已签收 %d 天，七天无理由与十五天质量问题窗口都已过", signedDays);
-    }
-
     private void appendIfPresent(StringBuilder sb, String label, Timestamp value) {
         if (value != null) {
             sb.append(String.format("%s: %s%n", label, BitToolSupport.dateTime(value)));
         }
     }
-
 }

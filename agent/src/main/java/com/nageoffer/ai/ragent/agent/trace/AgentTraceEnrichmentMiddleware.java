@@ -20,7 +20,9 @@ package com.nageoffer.ai.ragent.agent.trace;
 import cn.hutool.core.util.StrUtil;
 import com.nageoffer.ai.ragent.agent.enums.AgentToolStatus;
 import com.nageoffer.ai.ragent.agent.memory.AgentContextChars;
+import com.nageoffer.ai.ragent.agent.model.AnthropicMessagesChatModel;
 import com.nageoffer.ai.ragent.agent.tool.AgentToolExecutionFacts;
+import com.nageoffer.ai.ragent.rag.config.InputGuardProperties;
 import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
@@ -45,7 +47,10 @@ import io.agentscope.core.middleware.AgentInput;
 import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.middleware.ModelCallInput;
 import io.agentscope.core.middleware.ReasoningInput;
+import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.ChatUsage;
+import io.agentscope.core.model.GenerateOptions;
+import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ToolSchema;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
@@ -62,8 +67,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -89,13 +96,21 @@ public class AgentTraceEnrichmentMiddleware implements MiddlewareBase {
      */
     private static final String AWAITING_PERMISSION_MESSAGE = "等待人工确认，工具尚未执行";
 
+    private static final String INPUT_GUARD_SPAN = "input_guard";
+
     private final Tracer tracer;
     private final AgentTraceSerializer serializer;
+
+    /**
+     * 入口审核方式，进程级常量，写在 input_guard 节点上
+     */
+    private final InputGuardProperties.Type inputGuardType;
 
     @Override
     public Flux<AgentEvent> onAgent(Agent agent, RuntimeContext ctx, AgentInput input,
                                     Function<AgentInput, Flux<AgentEvent>> next) {
         return Flux.deferContextual(ctxView -> {
+            AgentInputReviewContext.InputReview inputReview = AgentInputReviewContext.take();
             Span span = currentSpan(ctxView);
             if (!span.getSpanContext().isValid()) {
                 return next.apply(input);
@@ -114,6 +129,9 @@ public class AgentTraceEnrichmentMiddleware implements MiddlewareBase {
             // 中断发生在响应式链之外的 HTTP 线程上，那里只够得着 RuntimeContext，根 span 与轮次计数器都寄存进去
             // 轮数由 onReasoning 逐轮回写，不留到终止回调：取消信号自外向内传，外层先 end span 会把补写吞掉
             AgentRunTracer.bindRoot(ctx, span);
+            if (RagentAttributes.RUN_KIND_ASK.equals(runKind) && inputReview != null) {
+                traceInputReview(span, ctx, inputReview);
+            }
 
             RootOutput output = new RootOutput(span);
             return next.apply(input)
@@ -144,6 +162,20 @@ public class AgentTraceEnrichmentMiddleware implements MiddlewareBase {
                     // 取消跑在 Redisson 取消监听线程上，与仍在 append 的产出线程并发读同一个 answer，故要包一层
                     .doOnCancel(cancelQuietly("root_output", output::flush));
         });
+    }
+
+    /**
+     * 入口审核跑在 Agent 启动之前，这里按它真实的起止时刻补成根节点的子节点，所以它排在根节点开始之前
+     */
+    private void traceInputReview(Span root, RuntimeContext ctx, AgentInputReviewContext.InputReview review) {
+        Span span = tracer.spanBuilder(INPUT_GUARD_SPAN)
+                .setParent(Context.root().with(root))
+                .setStartTimestamp(review.startedAt())
+                .startSpan();
+        span.setAttribute(AgentTraceAttributes.OBSERVATION_TYPE, AgentTraceAttributes.TYPE_GUARDRAIL);
+        span.setAttribute(RagentAttributes.INPUT_GUARD_TYPE, inputGuardType.name().toLowerCase(Locale.ROOT));
+        AgentRunTracer.writeIdentity(span, ctx);
+        span.end(review.endedAt());
     }
 
     /**
@@ -216,7 +248,7 @@ public class AgentTraceEnrichmentMiddleware implements MiddlewareBase {
             span.setAttribute(AgentTraceAttributes.MODEL_PARAMETERS, serializer.modelParameters(input.options()));
             // 官方那层建了 chat span 却没写这两个规范属性，provider 是必填、stream 漏写会被读成非流式
             // 模型名反过来，它写的 gen_ai.request.model 与 langfuse.observation.model.name 喂同一个列，我方不必再写一遍
-            span.setAttribute(GenAiAttributes.PROVIDER_NAME, GenAiAttributes.PROVIDER_OPENAI);
+            span.setAttribute(GenAiAttributes.PROVIDER_NAME, GenAiAttributes.providerOf(input.model()));
             span.setAttribute(GenAiAttributes.REQUEST_STREAM, true);
             // 遮蔽生效之后的名单，能直接看出技能遮蔽有没有在干活
             span.setAttribute(RagentAttributes.TOOLS_VISIBLE, toolNames(input.tools()));
@@ -231,7 +263,12 @@ public class AgentTraceEnrichmentMiddleware implements MiddlewareBase {
             AtomicBoolean firstDelta = new AtomicBoolean();
             Runnable writeOutput = () -> span.setAttribute(AgentTraceAttributes.OBSERVATION_OUTPUT,
                     serializer.modelOutput(text, thinking, toolCalls));
-            return next.apply(input)
+            // 缓存写入量只在响应元数据里，事件流带不出来；包一层模型截下它，跟着本次调用走
+            AtomicReference<Integer> cacheWrite = new AtomicReference<>();
+            ModelCallInput tapped = input.model() instanceof AnthropicMessagesChatModel model
+                    ? new ModelCallInput(input.messages(), input.tools(), input.options(), new CacheWriteTap(model, cacheWrite))
+                    : input;
+            return next.apply(tapped)
                     .doOnNext(event -> {
                         if (event instanceof TextBlockDeltaEvent delta) {
                             markCompletionStart(span, firstDelta);
@@ -244,7 +281,7 @@ public class AgentTraceEnrichmentMiddleware implements MiddlewareBase {
                         } else if (event instanceof ToolCallEndEvent call) {
                             toolCalls.add(describeToolCall(pendingArguments, call));
                         } else if (event instanceof ModelCallEndEvent end) {
-                            writeUsage(span, end.getUsage());
+                            writeUsage(span, end.getUsage(), cacheWrite.get());
                         }
                     })
                     .doOnTerminate(writeOutput)
@@ -360,13 +397,13 @@ public class AgentTraceEnrichmentMiddleware implements MiddlewareBase {
                 .collect(Collectors.joining(", "));
     }
 
-    private void writeUsage(Span span, ChatUsage usage) {
+    private void writeUsage(Span span, ChatUsage usage, Integer cacheWrite) {
         if (usage == null) {
             return;
         }
         // gen_ai.usage.* 官方已写两项，但 cachedTokens 没有对应的通用属性，这里补一份完整的
-        span.setAttribute(AgentTraceAttributes.USAGE_DETAILS, serializer.usageDetails(
-                usage.getInputTokens(), usage.getOutputTokens(), usage.getCachedTokens(), usage.getTotalTokens()));
+        span.setAttribute(AgentTraceAttributes.USAGE_DETAILS, serializer.usageDetails(usage.getInputTokens(),
+                usage.getOutputTokens(), usage.getCachedTokens(), cacheWrite, usage.getTotalTokens()));
     }
 
     /**
@@ -691,6 +728,33 @@ public class AgentTraceEnrichmentMiddleware implements MiddlewareBase {
 
         private static String callKey(String toolCallId) {
             return StrUtil.blankToDefault(toolCallId, FALLBACK_CALL_KEY);
+        }
+    }
+
+    /**
+     * 只截缓存写入量，其余原样转给被包的模型
+     */
+    private record CacheWriteTap(Model delegate, AtomicReference<Integer> sink) implements Model {
+
+        @Override
+        public Flux<ChatResponse> stream(List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
+            return delegate.stream(messages, tools, options).doOnNext(response -> {
+                Object tokens = response.getMetadata() == null ? null
+                        : response.getMetadata().get(AnthropicMessagesChatModel.METADATA_CACHE_WRITE_TOKENS);
+                if (tokens instanceof Integer value) {
+                    sink.set(value);
+                }
+            });
+        }
+
+        @Override
+        public String getModelName() {
+            return delegate.getModelName();
+        }
+
+        @Override
+        public int getContextWindowSize() {
+            return delegate.getContextWindowSize();
         }
     }
 }

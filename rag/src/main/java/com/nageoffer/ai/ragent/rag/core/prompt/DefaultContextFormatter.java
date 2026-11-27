@@ -20,7 +20,7 @@ package com.nageoffer.ai.ragent.rag.core.prompt;
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
 import com.nageoffer.ai.ragent.framework.convention.RetrievedChunk;
-import com.nageoffer.ai.ragent.framework.convention.RetrievedChunkKey;
+import com.nageoffer.ai.ragent.rag.config.SearchChannelProperties;
 import com.nageoffer.ai.ragent.rag.core.intent.NodeScore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -43,13 +43,13 @@ import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.CONTEXT_FORMAT_PA
 public class DefaultContextFormatter implements ContextFormatter {
 
     private final PromptTemplateLoader templateLoader;
+    private final SearchChannelProperties searchChannelProperties;
 
     @Override
     public String formatKbContext(List<NodeScore> kbIntents,
                                   Set<String> eligibleIntentIds,
-                                  List<RetrievedChunk> rerankedChunks,
-                                  int contextTopK) {
-        if (CollUtil.isEmpty(rerankedChunks)) {
+                                  List<RetrievedChunk> contextChunks) {
+        if (CollUtil.isEmpty(contextChunks)) {
             return "";
         }
 
@@ -63,12 +63,12 @@ public class DefaultContextFormatter implements ContextFormatter {
                 branch,
                 eligibleIntents.stream().map(ns -> ns.getNode().getName()).toList());
         if (eligibleIntents.isEmpty()) {
-            return formatChunksWithoutIntent(rerankedChunks, contextTopK);
+            return renderKbSection("", renderChunksGroupedByDoc(contextChunks));
         }
         if (eligibleIntents.size() > 1) {
-            return formatMultiIntentContext(eligibleIntents, rerankedChunks, contextTopK);
+            return formatMultiIntentContext(eligibleIntents, contextChunks);
         }
-        return formatSingleIntentContext(eligibleIntents.get(0), rerankedChunks, contextTopK);
+        return formatSingleIntentContext(eligibleIntents.get(0), contextChunks);
     }
 
     private List<NodeScore> eligibleIntents(List<NodeScore> kbIntents,
@@ -85,19 +85,16 @@ public class DefaultContextFormatter implements ContextFormatter {
     /**
      * 格式化单意图上下文
      */
-    private String formatSingleIntentContext(NodeScore nodeScore, List<RetrievedChunk> rerankedChunks, int topK) {
+    private String formatSingleIntentContext(NodeScore nodeScore, List<RetrievedChunk> contextChunks) {
         String snippet = StrUtil.emptyIfNull(nodeScore.getNode().getPromptSnippet()).trim();
-        String docBlocks = renderChunksGroupedByDoc(distinctChunks(rerankedChunks), topK);
-        return renderKbSection(renderSnippetRules(snippet), docBlocks);
+        return renderKbSection(renderSnippetRules(snippet), renderChunksGroupedByDoc(contextChunks));
     }
 
     /**
      * 格式化多意图上下文
      */
-    private String formatMultiIntentContext(List<NodeScore> kbIntents,
-                                            List<RetrievedChunk> rerankedChunks,
-                                            int topK) {
-        // 1. 合并所有意图的回答规则
+    private String formatMultiIntentContext(List<NodeScore> kbIntents, List<RetrievedChunk> contextChunks) {
+        // 合并所有意图的回答规则
         List<String> snippets = kbIntents.stream()
                 .map(ns -> ns.getNode().getPromptSnippet())
                 .filter(StrUtil::isNotBlank)
@@ -113,31 +110,7 @@ public class DefaultContextFormatter implements ContextFormatter {
             snippetSection = renderSnippetRules(numberedRules);
         }
 
-        // 2. 合并所有意图的文档片段（按 chunk id 去重，保持相关性顺序）
-        List<RetrievedChunk> allChunks = distinctChunks(rerankedChunks);
-
-        if (allChunks.isEmpty()) {
-            return snippetSection;
-        }
-
-        String docBlocks = renderChunksGroupedByDoc(allChunks, topK);
-        return renderKbSection(snippetSection, docBlocks);
-    }
-
-    private String formatChunksWithoutIntent(List<RetrievedChunk> rerankedChunks, int topK) {
-        List<RetrievedChunk> chunks = distinctChunks(rerankedChunks);
-        if (chunks.isEmpty()) {
-            return "";
-        }
-
-        String docBlocks = renderChunksGroupedByDoc(chunks, topK);
-        return renderKbSection("", docBlocks);
-    }
-
-    private List<RetrievedChunk> distinctChunks(List<RetrievedChunk> chunks) {
-        Map<String, RetrievedChunk> distinct = new LinkedHashMap<>();
-        chunks.forEach(chunk -> distinct.putIfAbsent(RetrievedChunkKey.of(chunk), chunk));
-        return new ArrayList<>(distinct.values());
+        return renderKbSection(snippetSection, renderChunksGroupedByDoc(contextChunks));
     }
 
     private String renderKbSection(String snippetSection, String docBlocks) {
@@ -160,17 +133,11 @@ public class DefaultContextFormatter implements ContextFormatter {
      * 文档之间按相关性排序（各文档首个命中块在原列表中的顺序，即该文档最佳块的排名），
      * 文档内部按 {@code chunkIndex} 升序还原原文顺序；docId 缺失的块各自单独成组、留在原位
      */
-    private String renderChunksGroupedByDoc(List<RetrievedChunk> chunks, int topK) {
-        long limit = topK > 0 ? topK : Long.MAX_VALUE;
-        List<RetrievedChunk> limited = chunks.stream().limit(limit).toList();
-        if (limited.isEmpty()) {
-            return "";
-        }
-
+    private String renderChunksGroupedByDoc(List<RetrievedChunk> chunks) {
         // 按 docId 分组：LinkedHashMap 保持首次出现顺序 = 文档间的相关性排序；docId 为空的块各自单独成组
         LinkedHashMap<String, List<RetrievedChunk>> groups = new LinkedHashMap<>();
         int anonymousSeq = 0;
-        for (RetrievedChunk chunk : limited) {
+        for (RetrievedChunk chunk : chunks) {
             String key = StrUtil.isNotBlank(chunk.getDocId()) ? chunk.getDocId() : "__nodoc__" + (anonymousSeq++);
             groups.computeIfAbsent(key, k -> new ArrayList<>()).add(chunk);
         }
@@ -181,10 +148,10 @@ public class DefaultContextFormatter implements ContextFormatter {
     }
 
     /**
-     * 渲染单个文档块：组内按序号排序后拼接，只带内部 docId 作为锚点
+     * 渲染单个文档块：组内按序号排序后拼接，带内部 docId 作为锚点，开关开启时首行放一次文档名
      * <p>
-     * 刻意不注入文档标题：标题一旦进入上下文，模型就会写出"出自《XX》"之类的归因表述，
-     * 而提示词层面的禁令压不住。资料之间的区分交给 {@code ref} 编号，文档名只在前端来源列表展示
+     * 文档名原样使用、不剥扩展名，想让模型看到干净的名字就在后台改名；它会诱导模型写"出自《XX》"，
+     * 压住它的只有 KB_ANSWER 里不报文档名的规则，换模型或改提示词后要抽查回答
      */
     private String renderDocBlock(List<RetrievedChunk> group) {
         List<RetrievedChunk> ordered = group.stream()
@@ -192,8 +159,8 @@ public class DefaultContextFormatter implements ContextFormatter {
                         Comparator.nullsLast(Comparator.naturalOrder())))
                 .toList();
 
-        String chunks = joinDocBody(ordered);
-        String docId = sanitizeAttribute(resolveDocId(group));
+        String chunks = withDocName(group, joinDocBody(ordered));
+        String docId = sanitize(resolveDocId(group));
         if (StrUtil.isNotBlank(docId)) {
             return templateLoader.renderSection(CONTEXT_FORMAT_PATH, "kb-doc-block", Map.of(
                     "doc_id", docId,
@@ -216,10 +183,22 @@ public class DefaultContextFormatter implements ContextFormatter {
                 .collect(Collectors.joining("\n"));
     }
 
+    private String withDocName(List<RetrievedChunk> group, String body) {
+        if (!searchChannelProperties.isIncludeDocName()) {
+            return body;
+        }
+        String docName = sanitize(resolveDocName(group));
+        if (StrUtil.isBlank(docName)) {
+            return body;
+        }
+        return templateLoader.renderSection(CONTEXT_FORMAT_PATH, "kb-doc-name", Map.of("doc_name", docName))
+                + "\n" + body;
+    }
+
     /**
-     * 清洗属性值里会破坏伪标签结构的字符（引号、尖括号）
+     * 清洗会破坏伪标签结构的字符（引号、尖括号）
      */
-    private String sanitizeAttribute(String value) {
+    private String sanitize(String value) {
         if (StrUtil.isBlank(value)) {
             return "";
         }
@@ -229,6 +208,14 @@ public class DefaultContextFormatter implements ContextFormatter {
     private String resolveDocId(List<RetrievedChunk> group) {
         return group.stream()
                 .map(RetrievedChunk::getDocId)
+                .filter(StrUtil::isNotBlank)
+                .findFirst()
+                .orElse("");
+    }
+
+    private String resolveDocName(List<RetrievedChunk> group) {
+        return group.stream()
+                .map(RetrievedChunk::getDocName)
                 .filter(StrUtil::isNotBlank)
                 .findFirst()
                 .orElse("");

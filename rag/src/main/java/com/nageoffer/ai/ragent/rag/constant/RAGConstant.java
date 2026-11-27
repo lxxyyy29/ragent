@@ -79,6 +79,17 @@ public class RAGConstant {
      */
     public static final String GUIDANCE_AMBIGUITY_CHECK_PROMPT_PATH = "prompt/guidance-ambiguity-check.st";
 
+    /**
+     * 用户输入审核规则，所有助手共用，不进提示词槽位
+     * 全文没有占位符：待审原文由代码序列化成 JSON 放进用户消息
+     */
+    public static final String INPUT_RISK_REVIEW_PROMPT_PATH = "prompt/input-risk-review.st";
+
+    /**
+     * Jev 输入审核的 Noul 命题，每个风险类别三段 section：-instructions / -true / -false
+     */
+    public static final String INPUT_RISK_JEV_PROMPT_PATH = "prompt/input-risk-jev.st";
+
 
     /**
      * 查询改写 + 多问句拆分提示词模板路径
