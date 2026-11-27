@@ -276,17 +276,19 @@ ai:
     candidates:
       - id: qwen3-local
         provider: ollama
-        model: qwen3:8b
+        model: qwen2.5-coder:7b
         supports-thinking: true
       - id: qwen-plus
         provider: bailian
         model: qwen-plus-latest
+        supports-thinking: true
       - id: qwen-flash
         provider: bailian
         model: qwen-flash
       - id: qwen3.8
         provider: bailian
         model: qwen3.8-27b
+        supports-thinking: true
       - id: gpt-6.1-sol
         provider: aihubmix
         model: gpt-6.1-sol
@@ -308,8 +310,8 @@ ai:
 
     tiers:
       fast:
-        candidates: [ qwen-plus, qwen3-local ]
-        timeout-ms: 10000
+        candidates: [ qwen-flash, qwen-plus, qwen3-local ]
+        timeout-ms: 30000
       standard:
         candidates: [ qwen3.8, qwen-plus, qwen3-local ]
         timeout-ms: 120000
